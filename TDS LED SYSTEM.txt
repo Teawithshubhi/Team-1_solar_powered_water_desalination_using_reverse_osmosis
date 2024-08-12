@@ -1,0 +1,340 @@
+//*-----------------------------------------------------------------------------
+	File Name:	Team-1_solar_powered_water_desalination_using_reverse_osmosis
+	Author:		Team-1
+	Date:		11/08/2024
+	Modified:	None
+	© Fanshawe College, 2023
+
+	Description: 	Description: Develop and implement hardware sampling algorithms for the
+                 	automated collection of data from multiple sensors at timed 
+                 	intervals. The system filters and averages these samples to 
+                 	drive appropriate actions for efficient operation. The project 
+                 	also includes designing a modular approach for integrating 
+                 	additional sensors or input devices in a solar-powered water 
+                 	desalination system utilizing reverse osmosis technology.
+-----------------------------------------------------------------------------*/
+// Use of AI / Cognitive Assistance software is not allowed in any exercise.
+
+/* Preprocessor ---------------------------------------------------------------
+   Hardware Configuration Bits ----------------------------------------------*/
+#pragma config FOSC		= INTIO67
+#pragma config PLLCFG	= OFF
+#pragma config PRICLKEN = ON
+#pragma config FCMEN	= OFF
+#pragma config IESO		= OFF
+#pragma config PWRTEN	= OFF 
+#pragma config BOREN	= ON
+#pragma config BORV		= 285 
+#pragma config WDTEN	= OFF
+#pragma config PBADEN	= OFF
+#pragma config LVP		= OFF
+#pragma config MCLRE	= EXTMCLR
+
+// Libraries ------------------------------------------------------------------
+#include <p18f45k22.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <delays.h>
+#include "xlcd.h"
+#include <string.h>
+
+// Constants  -----------------------------------------------------------------
+#define TRUE	1	
+#define FALSE	0
+#define DELAYCOUNT 25 // Defines value for the oscillator 
+#define ONESEC 0x0BDC
+#define BYTESIZE 8
+#define T0FLAG INTCONbits.TMR0IF
+#define ONEMINSEC 60
+#define ONEDAY 24	
+#define BUFSIZE 10
+#define RC1FLAG PIR1bits.RC1IF
+#define INTGON 0xC0
+#define TOKENSIZE 35
+#define PSC_VALUE 0x0BDC
+#define BUFFLIM 20 // Limit for data buffers
+#define DELAYCOUNT_1 60   // For 15ms of delay
+#define DELAYCOUNT_2 20   // For 5ms of delay
+#define DEBOUNCE_DELAY 20
+#define GREEN "$GREEN"
+#define RED "$RED"
+
+// Global Variables  ----------------------------------------------------------
+typedef char flag_t;
+flag_t sentenceRdy = FALSE;  // Flag to indicate if a complete sentence has been received
+char buf[BUFSIZE] = {0};     // Buffer to store received data
+char *tokens[TOKENSIZE];    // Array of pointers to parse tokens from received data
+char insert = 0;            // Index for inserting data into the buffer
+char hold = 0;              // Temporary storage for received data
+
+unsigned char dataBuff[BUFFLIM];   // Data buffer 1
+unsigned char dataBuff2[BUFFLIM];  // Data buffer 2
+
+// Prototypes
+void ISR(); // Interrupt Service Routine prototype
+
+// Interrupt Vector -----------------------------------------------------------
+#pragma code interrupt_vector = 0x08
+
+void interrupt_vector(void)
+{
+	_asm
+		GOTO ISR  // Go to the Interrupt Service Routine (ISR) on interrupt
+	_endasm
+}
+
+#pragma code
+
+// Functions  -----------------------------------------------------------------
+
+/*>>> setOsc: -----------------------------------------------------------
+Author:		Team-1
+Date:	11/08/2024
+Modified:   None
+Desc:       Configures oscillator frequency and waits for stabilization.
+Input:      None 
+Returns:    None 
+ ----------------------------------------------------------------------------*/
+void setOsc(void)
+{	
+	OSCCON = 0x72;             // Configure oscillator control register
+	while(!OSCCONbits.HFIOFS); // Wait for high-frequency oscillator to stabilize
+} // eo setOsc::
+
+
+/*>>> setPort: -----------------------------------------------------------
+Author:		Team-1
+Date:	11/08/2024
+Modified:   Mohit Rayu on 7/11/2023
+Desc:       Configures port settings for input and output pins.
+Input:      None 
+Returns:    None 
+ ----------------------------------------------------------------------------*/
+void setPort(void)
+{
+	ANSELA = 0x00; // Disable analog inputs on PORTA
+	ANSELB = 0x00; // Disable analog inputs on PORTB
+	ANSELC = 0x00; // Disable analog inputs on PORTC
+	TRISCbits.TRISC3 = 0; // Set RC3 as output
+	TRISCbits.TRISC2 = 0; // Set RC2 as output
+	LATCbits.LATC3 = 0;   // Set RC3 low
+	LATCbits.LATC2 = 0;   // Set RC2 low
+	TRISA = 0xFF;  // Set PORTA as input
+	TRISB = 0xFF;  // Set PORTB as input
+} // eo setPort::
+
+
+/*>>> resetTMR0: -----------------------------------------------------------
+Author:		Team-1
+Date:	11/08/2024
+Modified:   None
+Desc:       Resets Timer0 flag and sets timer values for the specified count.
+Input:      int psc - Prescaler count value for the timer
+Returns:    None 
+ ----------------------------------------------------------------------------*/
+void resetTMR0(int psc)
+{
+	T0FLAG = FALSE; // Clear Timer0 interrupt flag
+	TMR0H = psc >> BYTESIZE; // Set high byte of Timer0
+	TMR0L = psc; // Set low byte of Timer0
+} // eo resetTMR0::
+
+
+/*>>> configTMR0: -----------------------------------------------------------
+Author:		Team-1
+Date:	11/08/2024
+Modified:   None
+Desc:       Configures Timer0 with the provided prescaler count value.
+Input:      int psc - Prescaler count value for Timer0
+Returns:    None
+ ----------------------------------------------------------------------------*/
+void configTMR0(int psc)
+{
+	resetTMR0(psc); // Set Timer0 prescaler values
+	T0CON = 0b00000101; // Configure Timer0 control register
+} // eo configTMR0::
+
+
+/*>>> configUSART1: -----------------------------------------------------
+Author:		Team-1
+Date:       7/11/2023
+Modified:   None
+Desc:       Configures settings for serial port 1 (USART1).
+Input:      None
+Returns:    None
+ ----------------------------------------------------------------------------*/
+void configUSART1(void)
+{
+	BAUDCON1 = 0x40; // Configure baud rate control register
+	TXSTA1 = 0x26;   // Configure transmit status and control register
+	RCSTA1 = 0x90;   // Configure receive status and control register
+	SPBRG1 = 103;    // Set baud rate generator value for 9600 baud
+	SPBRGH1 = 0x00;  // Set high byte of baud rate generator value
+} // eo configUSART1::
+
+void configUsart2(void)
+{
+	BAUDCON2 = 0x40; // Configure baud rate control register
+	TXSTA2 = 0x26;   // Configure transmit status and control register
+	RCSTA2 = 0x90;   // Configure receive status and control register
+	SPBRG2 = 12;     // Set baud rate generator value for 9600 baud
+} // eo configUsart2::
+
+
+/*>>> configINTS: -----------------------------------------------------------
+Author:		Mohit Rayu
+Date:		14/11/2023
+Modified:	None
+Desc:		Initializes interrupts for Receiver #1 to enable its operation.
+Input: 		None
+Returns:	None
+ ----------------------------------------------------------------------------*/
+void configINTS(void)
+{
+	// Configure Receiver #1 interrupt
+	IPR1bits.RC1IP = FALSE;    // Set Receiver #1 interrupt priority to low
+	PIR1bits.RC1IF = FALSE;    // Clear Receiver #1 interrupt flag
+	PIE1bits.RC1IE = TRUE;     // Enable Receiver #1 interrupt
+	
+	RCONbits.IPEN = FALSE;     // Disable global interrupt priority
+	INTCON |= INTGON;          // Enable global interrupts
+} // eo configINTS ::
+
+
+/*>>> clearUsartBuf: -----------------------------------------------------------
+Author:		Mohit Rayu
+Date:		14/11/2023
+Modified:	None
+Desc:		Clears the USART buffer.
+Input: 		char *bufptr - Pointer to the buffer to be cleared
+Returns:	None
+ ----------------------------------------------------------------------------*/
+void clearUsartBuf(char *bufptr)
+{
+	int tempValue;
+	for(tempValue = 0; tempValue < BUFSIZE; tempValue++)
+	{
+		*bufptr = FALSE; // Clear each byte in the buffer
+		bufptr++;
+	}
+} // eo clearUsartBuf ::
+
+
+/*>>> parseSent: -----------------------------------------------------------
+Author:		Mohit Rayu
+Date:		14/11/2023
+Modified:	None
+Desc:		Parses the received sentence into tokens based on delimiters.
+Input: 		char *ptr - Pointer to the buffer containing the sentence
+Returns:	None
+ ----------------------------------------------------------------------------*/
+void parseSent(char *ptr)
+{
+	char tokenCount = 0;
+    while(*ptr)
+    {
+        if(*ptr == '$' || *ptr == ',')
+        {
+            *ptr = '\0'; // Replace delimiter with null terminator
+            tokens[tokenCount] = ptr + 1; // Point to the next token
+            tokenCount++;
+        }
+        ptr++;
+    }
+} // eo parseSent ::
+
+/*>>> systemInit: -----------------------------------------------------------
+Author:		Team-1
+Date:       05/11/2023
+Modified:   Mohit Rayu on 14/11/2023
+Desc:       Initializes system settings and modules.
+Input:      None
+Returns:    None 
+ ----------------------------------------------------------------------------*/
+void systemInit(void)
+{
+	setOsc();            // Configure oscillator frequency and wait for stabilization
+	setPort();           // Configure port settings for input and output
+	configTMR0(ONESEC);  // Configure Timer0 with a prescaler value for a 1-second interval
+	configUSART1();      // Configure USART1 for serial communication
+	configINTS();        // Initialize and enable interrupts
+	
+	// Uncomment if additional USART configuration is needed
+	// configUsart2();    // Configure USART2 if required for additional serial communication
+	// clearUsartBuf(buf); // Clear the USART buffer if needed before starting new operations
+} // eo systemInit::
+
+#pragma interrupt ISR
+
+void ISR(void)
+{
+	// Check if the Receiver #1 interrupt flag is set
+	if (RC1FLAG == TRUE)
+	{
+		hold = RCREG1; // Read the received character from the USART1 receive register
+
+		// Check if the received character is the start-of-message delimiter ('$')
+		if (hold == '$')
+		{
+			insert = 0; // Reset the buffer index to start a new message
+		}
+
+		// Check if the received character is the end-of-message delimiter ('\r')
+		if (hold == '\r')
+		{
+			sentenceRdy = TRUE; // Set the flag to indicate that a complete message has been received
+		}
+
+		// Store the received character in the buffer and increment the buffer index
+		buf[insert] = hold;
+		insert++;
+	}
+
+	// Re-enable global and peripheral interrupts
+	INTCON |= 0xC0;
+} // eo ISR ::
+
+
+
+
+/*--- MAIN: FUNCTION ----------------------------------------------------------------------
+Author:		Team-1
+Date:       14/11/2023
+Modified:   None
+Desc:       The main function initializes the system, continuously checks a received 
+            value against a predefined constant, and controls outputs based on the comparison.
+            The function performs the following tasks:
+            1. Initializes the system using the `systemInit()` function.
+            2. Continuously monitors the received value (`recValue`).
+            3. Compares the received value to a predefined constant (`value`).
+            4. Controls the state of output pins based on the comparison.
+Input:      None
+Returns:    None
+---------------------------------------------------------------------------------------*/
+void main(void)
+{
+    char index = 0;     // Index for looping or array access (not used in this function)
+    int recValue = 0;   // Variable to store the received value converted from string
+    int value = 0;      // Predefined constant value to compare against
+
+    systemInit();       // Initialize the system and its peripherals
+
+    // Convert the received value and predefined constant from string to integer
+    recValue = atoi(buf); // Convert the received string buffer to integer
+    value = atoi(GREEN);  // Convert the predefined GREEN string constant to integer
+
+    while(1)  // Infinite loop
+    {
+        if(recValue == value)  // Check if the received value matches the predefined value
+        {
+            LATCbits.LATC3 = TRUE;  // Set LATC3 high (turn on output)
+        }
+        else
+        {
+            LATCbits.LATC2 = TRUE;  // Set LATC2 high (turn on output)
+        }
+        
+        // The function does not include any delays or further logic; it continuously
+        // evaluates and sets the outputs based on the value comparison.
+    }
+} // eo main::

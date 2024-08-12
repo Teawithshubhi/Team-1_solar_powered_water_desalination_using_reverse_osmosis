@@ -1,0 +1,708 @@
+//Use of AI / Cognitive Assistance Software is not allowed in any evaluation, assessment or exercise.
+/*=============================================================================
+	File Name:	Team-1_solar_powered_water_desalination_using_reverse_osmosis(HWR)
+	Author:		Team 1
+	Date:		11/08/2024
+	Modified:	11/08/2024 By Team 1
+	© Fanshawe College, 2024
+
+	Description: Develop hardware sampling algorithms for automatic sampling of multiple
+				 sensors on a timed interval. Filter and average the samples over time for
+				 appropriate system actions. Develop a portable method for
+				 adding or removing future sensors/input devices in a solar-powered water desalination system using reverse osmosis.
+=============================================================================*/
+/* Preprocessor ===============================================================
+   Hardware Configuration Bits ==============================================*/
+#pragma config FOSC		= INTIO67
+#pragma config PLLCFG	= OFF
+#pragma config PRICLKEN = ON
+#pragma config FCMEN	= OFF
+#pragma config IESO		= OFF
+#pragma config PWRTEN	= OFF 
+#pragma config BOREN	= ON
+#pragma config BORV		= 285 
+#pragma config WDTEN	= OFF
+#pragma config PBADEN	= OFF
+#pragma config LVP		= OFF
+#pragma config MCLRE	= EXTMCLR
+
+//Hardware Pins
+#define TRIGGER1 LATAbits.LATA1 //OUTPUT ANSEL = 0 && TRIS = 0
+#define ECHO1 PORTAbits.RA0 // INPUT ANSEL = 0 && TRIS = 1
+
+// Libraries ==================================================================
+#include <p18f45k22.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <delays.h>
+#include "xlcd.h"
+
+// Constants  =================================================================
+#define TRUE    1
+#define FALSE   0
+#define T0FLAG  INTCONbits.TMR0IF   // Timer0 overflow flag
+#define BYTESIZE 8
+#define SENCOUNT 1
+#define ONESEC  1
+#define MILSEC  0x0F2C  // Millisecond delay constant
+#define SAMPSIZE 10
+#define SPEED_OF_SOUND 34300.0  // Speed of sound in cm/s
+#define ADCRES 0.0048828125  // ADC resolution
+#define TDSCOUNT 3
+#define INTGON 0xC0
+#define TOKENSIZE 35
+#define RC1FLAG PIR1bits.RC1IF  // USART1 receive interrupt flag
+
+
+#define DELAYCOUNT_1 60   // for 15ms of delay
+#define DELAYCOUNT_2 20   // for 5ms of delay
+#define DEBOUNCE_DELAY 20
+
+#define TMRON T0CONbits.TMR0ON
+//#define T0FLAG INTCONbits.TMR0IF
+#define BYTESIZE 8
+#define PSC_VALUE 0x0BDC
+#define BUFFLIM 20 //limit for the dataBuff1 and dataBuff2 values
+
+
+
+ // Calcuation Constants ::::::::::::::::::::::::::::::::::::::::::::::::::::::
+#define MAXTIME		23509		// Î¼s
+#define CALCCM		60 		// Î¼s/cm
+#define CALCINCH	149.28088	// Î¼s/inch
+
+ // Timer Controls ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+#define TIMERON		( T0CONbits.TMR0ON=TRUE )
+#define TIMEROFF	( T0CONbits.TMR0ON=FALSE )
+#define RESETTIMER	( TMR0H=0x00;TMR0L=0x00 )
+#define GETTIME		( TMR0L+(TMR0H<<BYTESIZE) )	
+								
+
+// Function Prototpyes ::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+int getSR04Sample();	// Function to get sample from SR04 sensor
+
+// Global Variables  ==========================================================
+
+unsigned char dataBuff[BUFFLIM];	// Buffer for data
+unsigned char dataBuff2[BUFFLIM];	// Another buffer for data
+
+typedef int tds_t;	// Type definition for TDS measurements
+typedef struct
+{
+    tds_t samples[SAMPSIZE];  // Array to store samples
+    tds_t tdsval;             // Current TDS value
+    tds_t mintds;            // Minimum TDS value
+    tds_t maxtds;            // Maximum TDS value
+    char insert;             // Flag for insertion status
+    char avgRdy;            // Flag for average readiness
+}tdsCh_t;
+
+tdsCh_t tds[TDSCOUNT];	// Array of TDS channel structures
+
+
+float temperature = 25.0;  // Example temperature, update as needed
+
+
+typedef int sensor_t;	// Type definition for sensor measurements
+typedef struct
+{
+    sensor_t samples[SAMPSIZE];  // Array to store samples
+    sensor_t avgtime;           // Average time
+    sensor_t full;              // Full sensor reading
+    sensor_t empty;             // Empty sensor reading
+    char insert;                // Flag for insertion status
+    char avgRdy;                // Flag for average readiness
+}sensorCh_t;
+
+sensorCh_t sensor1;	// Sensor 1 data
+sensorCh_t sensor2;	// Sensor 2 data
+
+// Functions  =================================================================
+
+/*>>> setOsc: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		Configure the oscillator for 4 MHz operation and wait for stability.
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void setOsc(void)
+{
+    OSCCON = 0x72;  // Set the oscillator control register
+    while(!OSCCONbits.HFIOFS);  // Wait until the high-frequency oscillator is stable
+} // eo setOsc::
+
+/*>>> configPort: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		Configure the I/O ports. Set analog select, direction (input/output), 
+            	and latch registers for ports A, B, and C.
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void configPort(void)
+{
+
+    // Configure PORTA pins
+    // Set RA0, RA2 as input and RA1, RA3 as output
+    ANSELAbits.ANSA0 = 0;  // Set RA0 as digital I/O (not analog)
+    ANSELAbits.ANSA1 = 0;  // Set RA1 as digital I/O (not analog)
+    ANSELAbits.ANSA2 = 0;  // Set RA2 as digital I/O (not analog)
+    ANSELAbits.ANSA3 = 0;  // Set RA3 as digital I/O (not analog)
+    TRISAbits.TRISA0 = 1;  // Set RA0 as input
+    TRISAbits.TRISA1 = 0;  // Set RA1 as output
+    TRISAbits.TRISA2 = 1;  // Set RA2 as input
+    TRISAbits.TRISA3 = 0;  // Set RA3 as output
+
+    // Configure PORTB pins
+    // Set RB3 as input
+    ANSELBbits.ANSB3 = 0;  // Set RB3 as digital I/O (not analog)
+    TRISBbits.TRISB3 = 1;  // Set RB3 as input
+
+    // Configure PORTC pins
+    // Set RC2, RC3 as outputs
+    ANSELCbits.ANSC2 = 0;  // Set RC2 as digital I/O (not analog)
+    ANSELCbits.ANSC3 = 0;  // Set RC3 as digital I/O (not analog)
+    TRISCbits.TRISC2 = 0;  // Set RC2 as output
+    TRISCbits.TRISC3 = 0;  // Set RC3 as output
+
+    // Initialize output latch states
+    LATCbits.LATC3 = 0;    // Set RC3 low (initial state)
+    LATCbits.LATC2 = 0;    // Set RC2 low (initial state)
+	
+} // eo configPort::
+
+/*>>> DelayFor18TCY: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		
+Input: 		None 
+Returns:	None 
+============================================================================*/		
+void DelayFor18TCY(void)
+{
+	Nop();  // It creates a single cycle delay / NOP. 
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+	Nop();
+}
+
+/*>>> DelayPORXLCD: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		
+Input: 		None 
+Returns:	 
+============================================================================*/	
+void DelayPORXLCD (void)
+{
+ Delay1KTCYx(DELAYCOUNT_1); // Delay of 15ms by 16MHz Oscillator's frequecny. 
+ return;
+}
+
+
+
+/*>>> setOsc: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		
+Input: 		None 
+Returns:	None 
+============================================================================*/	
+
+void DelayXLCD (void)
+{
+ Delay1KTCYx(DELAYCOUNT_2); // Delay of 5ms by 16MHz Oscillator Frequecny. 
+ return;
+}
+
+/*>>> configADC: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		Configure the Analog-to-Digital Converter (ADC) module settings.
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void configADC(void)
+{
+	ADCON0 = 0x01;  // Enable ADC and select channel 0
+	ADCON1 = 0x00;  // Configure voltage reference and result format
+	ADCON2 = 0xA9;  // Set acquisition time and conversion clock
+} // eo configADC::
+
+
+/*>>> configUSART1: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		Configure the Universal Synchronous Asynchronous Receiver Transmitter (USART1) 
+            	for serial communication.
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void configUSART1(void)
+{
+	SPBRG1 = 103;    // Set baud rate generator register for the desired baud rate
+	TXSTA1 = 0x26;  // Configure transmit status and control register
+	RCSTA1 = 0x90;  // Configure receive status and control register
+	BAUDCON1 = 0x40; // Configure baud rate control register
+	SPBRGH1  = 0;
+} // eo configUSART1::
+
+
+/*>>> resetTMR0: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		Configure Timer0 by setting the Timer0 control register to enable the timer 
+            	with a specified prescaler value.
+Input: 		int psc, the prescaler value to be set for Timer0.
+Returns:	None
+ ============================================================================*/
+void resetTMR0(int psc)
+{
+	T0FLAG = FALSE;           // Clear the Timer0 overflow flag
+	TMR0H = psc >> BYTESIZE;  // Set the high byte of the prescaler value
+	TMR0L = psc;              // Set the low byte of the prescaler value
+} // eo resetTMR0::
+
+
+/*>>> configTMR0: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		Configure Timer0 by setting the Timer0 control register to enable the timer 
+            	with a specified prescaler value.
+Input: 		int psc, the prescaler value to be set for Timer0.
+Returns:	None
+ ============================================================================*/
+void configTMR0(int psc)
+{
+	resetTMR0(psc);// Set the Timer0 control register with the prescaler value and enable the timer
+	T0CON = 0b00000101;   // Initialize Timer0 register values
+} // eo configTMR0::
+
+/*>>> getADCSample: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		This function initiates an Analog-to-Digital Conversion (ADC) on 
+            	the specified channel and returns the result. It selects the ADC 
+            	channel, starts the conversion, waits for its completion, and then
+            	returns the converted digital value.
+Input: 		char chan, the ADC channel to sample. This parameter determines
+            	which ADC channel (0-7) is being read.
+Returns:	sensor_t, the result of the ADC conversion which represents the 
+            	digital value corresponding to the analog input from the selected 
+           	channel.
+ ============================================================================*/
+tds_t getADCSample(char chan)
+{
+	ADCON0bits.CHS = chan; // Set the ADC channel selection to the specified channel
+	ADCON0bits.GO = TRUE;  // Initiate the ADC conversion process
+	while(ADCON0bits.GO);  // Poll the GO bit until the conversion is complete
+	return ADRES;          // Read and return the result from the ADC data register
+} // eo getADCSample::
+
+
+
+/*>>> setLCD: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void setLCD(void)
+{
+	char pbState = 0x08;
+	char index = 0;
+	char countIndex = 0;
+	char ddAddr = 0x80;
+	char count = 0;
+	setOsc();
+	
+	configTMR0(PSC_VALUE);
+
+	//Setting the Oscillator for the 16MHz frequecny.  
+	
+	OpenXLCD(EIGHT_BIT & LINES_5X7);
+	SetDDRamAddr(ddAddr);			// This function is used to keep or set the 
+									// cursor at particular location.
+	while(dataBuff[index] != '\0')
+	{
+		WriteDataXLCD(dataBuff[index]);
+		index++;
+		Delay1KTCYx(18);
+	}
+	index = 0;
+ 	while(BusyXLCD());
+
+	Delay10KTCYx(20);
+
+
+	SetDDRamAddr(0x40);			// This function is used to keep or set the 									// cursor at particular location.
+	Delay10KTCYx(50);
+	while(dataBuff2[index] != '\0')
+	{
+		WriteDataXLCD(dataBuff2[index]);
+		index++;
+		Delay10KTCYx(50);
+	}
+	while(BusyXLCD());
+//	Delay10KTCYx(200);*/
+	WriteCmdXLCD(0x01);             // Clear display
+
+}
+
+/*>>> initSensorCh: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		This function initializes the sensor channel structure by setting 
+            all sample values and configuration fields to their default states. 
+            It ensures that the sensor channel is ready for use by initializing 
+            arrays and configuration parameters.
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void initSensorCh()
+{
+	int index = 0;	
+	
+	// Initialize all sample values in the sensor1.samples array to FALSE
+	for(index = 0; index < SAMPSIZE; index++)
+	{
+		sensor1.samples[index] = FALSE;	
+	}
+
+	// Set the average time to FALSE, indicating no valid average time yet
+	sensor1.avgtime = FALSE;
+
+	// Set predefined limits for full and empty states of the sensor
+	sensor1.full = 45;	
+	sensor1.empty = 90;
+
+	// Initialize the insert flag and average readiness flag to FALSE
+	sensor1.insert = FALSE;
+	sensor1.avgRdy = FALSE;
+
+} // eo initSensorCh::
+
+
+
+/*>>> initTdsCh: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		This function initializes a TDS (Total Dissolved Solids) channel 
+            structure by setting all sample values and configuration fields 
+            to their default states. It prepares the TDS channel for accurate 
+            measurements and operations by initializing arrays and parameters.
+Input: 		tdsCh_t *tsen, a pointer to the TDS channel structure to be 
+            initialized. This input is used to access and modify the 
+            structure's fields.
+Returns:	None
+ ============================================================================*/
+void initTdsCh(tdsCh_t *tsen)
+{
+	int index = 0;
+
+	// Initialize all sample values in the tsen->samples array to FALSE
+	for(index = 0; index < SAMPSIZE; index++)
+	{
+		tsen -> samples[index] = FALSE;	
+	}
+
+	// Set the TDS value, minimum TDS, and maximum TDS to FALSE, indicating 
+    	// no valid values yet
+	tsen -> tdsval = FALSE;
+	tsen -> mintds = FALSE;
+	tsen -> maxtds = FALSE;
+
+	// Initialize the insert flag and average readiness flag to FALSE
+	tsen -> insert = FALSE;
+	tsen -> avgRdy = FALSE;
+
+} // eo initTdsCh::
+
+
+
+/*>>> tdsSample: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		This function performs a sampling operation for TDS (Total Dissolved 
+            	Solids) channels. It reads ADC values for each TDS channel, computes 
+            	an average, applies temperature compensation, and then calculates 
+            	the TDS value based on the compensated voltage. The function iterates 
+            	through available TDS channels and updates their respective data 
+            	structures.
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void tdsSample()
+{
+	int index = 0;
+	char chID = 0;
+	float averageVoltage = 0;
+	float compensationCoefficient = 0;
+	float compensationVoltage = 0;
+	
+	// Iterate through TDS channels starting from channel 2 up to TDSCOUNT
+	for(chID = 2; chID < TDSCOUNT; chID++)
+	{
+		// Sample the ADC value for the current TDS channel
+		tds[chID].samples[tds[chID].insert] = getADCSample(chID);
+		// Move to the next index in the samples array
+		tds[chID].insert++;
+		// If the insert index exceeds the sample size, reset and mark average as ready
+		if(tds[chID].insert >= SAMPSIZE)
+		{
+			tds[chID].insert = FALSE;
+			tds[chID].avgRdy = TRUE;
+		}
+		// If average is ready, compute the average TDS value
+		if(tds[chID].avgRdy)
+		{
+			long sum = 0;
+			tds[chID].tdsval = 0;
+			for(index = 0; index < SAMPSIZE; index++)
+			{
+				sum += tds[chID].samples[index];
+			}
+			tds[chID].tdsval = sum / SAMPSIZE;	
+		}
+		// Convert the TDS value to voltage
+		averageVoltage = (float)tds[chID].tdsval * ADCRES;
+		
+		// Calculate temperature compensation coefficient (e.g., 0.02 per degree Celsius)
+	    compensationCoefficient = 1.0 + 0.02 * (temperature - 25.0);  // Adjust temperature as needed
+	    // Apply temperature compensation to the voltage
+	    compensationVoltage = averageVoltage / compensationCoefficient;
+		
+		// Compute the final TDS value from the compensated voltage using a polynomial formula
+		tds[chID].tdsval = (133.42 * compensationVoltage * compensationVoltage * compensationVoltage - 
+		                    255.86 * compensationVoltage * compensationVoltage + 
+		                    857.39 * compensationVoltage) * 0.5;
+	}	
+} // eo tdsSample::
+
+
+
+/*>>> systemInit: ===========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		This function initializes the entire system by performing various 
+            configuration tasks. It sets up the oscillator, configures I/O ports, 
+            initializes the Analog-to-Digital Converter (ADC), configures the USART1 
+            module, and sets up Timer0. Additionally, it initializes the sensor 
+            channel structure.
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void systemInit(void)
+{
+	// Configure the system oscillator for desired frequency and stability
+	setOsc();          
+
+	// Set up the I/O ports according to the application needs
+	configPort();       
+
+	// Initialize the ADC module for analog-to-digital conversion
+	configADC();        
+
+	// Configure USART1 for serial communication
+	configUSART1();     
+
+	// Set up Timer0 with the specified prescaler value to generate time delays
+	configTMR0(MILSEC); 
+
+	// Initialize the sensor channel structure with default values
+	initSensorCh();
+	
+}
+// eo systemInit::
+
+
+/*>>> get1SR04Sample: ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+Author:		CTalbot
+Date:		02/10/2023
+Modified:	None
+Desc:		This function triggers an ultrasonic sensor to measure distance. It 
+            sends a pulse to the sensor and waits for the echo signal to return. 
+            The function then measures the duration of the echo signal in microseconds 
+            and returns this value. If the echo duration exceeds a predefined maximum 
+            time, the function returns 0 to indicate a "Bad-Read" or an invalid measurement.
+Input: 		None
+Returns:	int, the duration in microseconds that the echo pin was high. If the 
+            duration exceeds a maximum allowable time, 0 is returned to indicate 
+            an invalid reading ("Bad-Read").
+ ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::*/
+sensor_t get1SR04Sample()
+{
+	int time = 0;		// Variable to hold the time count in microseconds
+	TMR0H=0x00;        // Clear Timer0 High byte
+	TMR0L=0x00;        // Clear Timer0 Low byte
+//	RESETTIMER;        // Optionally reset Timer counts to 0 (commented out)
+	TRIGGER1 = TRUE;   // Activate the ultrasonic sensor trigger
+	Delay10TCYx(1);    // Wait for 10 microseconds
+	TRIGGER1 = FALSE;  // Deactivate the trigger
+	while(!ECHO1);     // Wait for the echo pin to go high
+	TIMERON;           // Start Timer to measure the duration of the echo pulse
+	while(ECHO1);      // Continue waiting while the echo pin is high
+	TIMEROFF;          // Stop the Timer
+	time = GETTIME;    // Retrieve the measured time in microseconds
+	if(time > MAXTIME) // Check if the measured time exceeds the maximum allowed value
+	{
+		time = 0;	// Indicate a "Bad-Read" by setting time to 0
+	}
+	return time;		// Return the measured duration in microseconds
+}// eo get1SR04Sample::
+
+
+
+
+/*>>> sensorsample: ==========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		This function samples data from an ultrasonic sensor and calculates 
+            the average measurement. It stores the current sample, updates the 
+            index, and computes the average time when enough samples have been 
+            collected.
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void sensorsample()
+{
+	int index = 0;                      // Loop index for calculating the average
+
+	// Sample data from the ultrasonic sensor and store it in the current position
+	sensor1.samples[sensor1.insert] = get1SR04Sample();
+	
+	// Update the index for storing the next sample
+	sensor1.insert++;
+	
+	// Check if we have collected enough samples
+	if(sensor1.insert >= SAMPSIZE)
+	{
+		sensor1.insert = FALSE;          // Reset the index to start overwriting old samples
+		sensor1.avgRdy = TRUE;          // Indicate that the average is ready to be calculated
+	}
+	
+	// If enough samples have been collected, calculate the average
+	if(sensor1.avgRdy)
+	{
+		long sum = 0;                   // Variable to hold the sum of all samples
+		sensor1.avgtime = 0;            // Initialize average time to 0
+		
+		// Calculate the sum of all samples
+		for(index = 0; index < SAMPSIZE; index++)
+		{
+			sum += sensor1.samples[index];
+		}
+		
+		// Calculate the average time by dividing the sum by the number of samples
+		sensor1.avgtime = sum / SAMPSIZE;	
+	}
+}
+
+
+
+/*=== MAIN: FUNCTION ==========================================================
+Author:		Team-1
+Date:		11/08/2024
+Modified:	None
+Desc:		Main function of the program. Initializes the system, sets up TDS 
+            channels, and enters an infinite loop where it continuously samples 
+            TDS values and manages the motor and pump based on sensor readings.
+Input: 		None
+Returns:	None
+ ============================================================================*/
+void main(void)
+{
+	int index = 0;                      // Loop index for various operations
+	char chID = 0;                      // Channel ID for TDS measurement
+	char count = 0;                    // Counter for time-based operations
+	float averageVoltage = 0;          // Average voltage for TDS measurement
+	float compensationCoefficient = 0; // Coefficient for temperature compensation
+	float compensationVoltage = 0;     // Voltage after compensation
+	LATCbits.LATC3 = 0;                // Initialize LATC3 pin to 0 (motor off)
+	
+	systemInit();                      // Initialize the system including I/O, ADC, etc.
+	
+	// Initialize each TDS channel
+	for(index = 0; index < TDSCOUNT; index++)
+	{
+		initTdsCh(&tds[index]);         // Initialize TDS channel structure
+	}	
+	
+	while(1)                           // Infinite loop for continuous operation
+	{
+		tdsSample();                    // Sample the TDS values
+		printf("$TDS VALUE: %i", tds[2].tdsval); // Print TDS value of channel 2
+		sprintf(dataBuff, "TDS Value %i", tds[2].tdsval);
+		count++;
+			
+		// Check if one second has elapsed
+		if(count >= ONESEC) 
+		{
+			count = 0;                 // Reset count
+			sensorsample();            // Sample the sensor data
+			// Check if the tank is not empty and if tank 2 is not full
+			if (sensor1.avgtime < sensor1.empty && sensor1.avgRdy) 
+			{
+				if(PORTBbits.RB3 == 0) // If tank 2 is not full
+				{
+					LATCbits.LATC2 = TRUE;  // Turn on pump
+					LATCbits.LATC3 = TRUE;  // Turn on motor
+					// Clear data buffer and update with status message
+					for(index = 0; index < BUFFLIM; index++)
+					{
+						dataBuff2[index] = 0;
+					}
+					sprintf(dataBuff2, "PUMP START");
+					
+				}
+				else
+				{
+					LATCbits.LATC2 = FALSE; // Turn off pump
+					LATCbits.LATC3 = FALSE; // Turn off motor
+					sprintf(dataBuff2, "PUMP STOP");
+
+				}
+			}
+			else
+			{
+				LATCbits.LATC2 = FALSE; // Turn off pump
+				LATCbits.LATC3 = FALSE; // Turn off motor
+			}
+			
+		}	//eo if count::
+		setLCD();
+
+	}	//eo while::
+}  // eo main::
